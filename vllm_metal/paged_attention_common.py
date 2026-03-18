@@ -5,7 +5,7 @@ Provides the thread-local ``PagedAttentionContext`` and ``OffsetCache`` used by
 both the Metal kernel paged attention backend and the model runner.
 
 Usage:
-    1. Before each forward pass call ``prepare_prefill()`` or ``prepare_decode()``
+    1. Before each forward pass call ``prepare_prefill_packed()`` or ``prepare_decode()``
     2. Run ``model(input_ids, cache=offset_caches)`` as normal
     3. The attention wrapper reads ``get_context()`` to decide prefill vs decode
     4. Call ``clear_context()`` after the forward pass
@@ -26,7 +26,7 @@ from mlx_lm.models.base import create_causal_mask
 # Thread-local storage used to pass per-request metadata (slot_mapping,
 # block_tables, etc.) to attention wrappers buried inside the model.
 # We cannot add extra arguments to the mlx_lm forward signature, so
-# instead: prepare_prefill/decode() stashes context here before the
+# instead: prepare_prefill_packed/decode() stashes context here before the
 # forward pass, each attention wrapper reads it via get_context(), and
 # clear_context() cleans up afterwards.
 _thread_local = threading.local()
@@ -148,35 +148,16 @@ def find_layers_and_attr(model: Any) -> tuple[list[Any], str]:
 # ---------------------------------------------------------------------------
 
 
-def prepare_prefill(
-    block_ids: list[int],
-    num_tokens: int,
-    block_size: int,
-) -> None:
-    """Compute slot_mapping for prefill and set global context."""
-    slot_mapping = []
-    for pos in range(num_tokens):
-        block_idx = block_ids[pos // block_size]
-        slot = block_idx * block_size + (pos % block_size)
-        slot_mapping.append(slot)
-
-    set_context(
-        PagedAttentionContext(
-            is_prefill=True,
-            slot_mapping=slot_mapping,
-        )
-    )
-
-
 def prepare_prefill_packed(
     requests: list[tuple[list[int], int]],
     block_size: int,
 ) -> None:
-    """Compute slot_mapping and cu_seqlens for packed prefill.
+    """Compute slot_mapping, cu_seqlens, block_tables, context_lens for prefill.
 
-    Packs multiple prefill requests into a single forward pass.  The
-    attention wrapper uses ``cu_seqlens`` to build a block-diagonal
-    causal mask so that each request only attends to its own tokens.
+    Packs one or more prefill requests into a single forward pass.  The
+    varlen Metal kernel uses ``cu_seqlens`` to locate each sequence's
+    query tokens and ``block_tables`` / ``context_lens`` to read K/V
+    from the paged cache.
 
     Args:
         requests: list of (block_ids, num_tokens) per request.
@@ -184,6 +165,8 @@ def prepare_prefill_packed(
     """
     slot_mapping: list[int] = []
     cu_seqlens: list[int] = [0]
+    block_tables: list[list[int]] = []
+    context_lens: list[int] = []
 
     for block_ids, num_tokens in requests:
         for pos in range(num_tokens):
@@ -191,11 +174,15 @@ def prepare_prefill_packed(
             slot = block_idx * block_size + (pos % block_size)
             slot_mapping.append(slot)
         cu_seqlens.append(cu_seqlens[-1] + num_tokens)
+        block_tables.append(block_ids)
+        context_lens.append(num_tokens)
 
     set_context(
         PagedAttentionContext(
             is_prefill=True,
             slot_mapping=slot_mapping,
+            block_tables=block_tables,
+            context_lens=context_lens,
             cu_seqlens=cu_seqlens,
         )
     )
