@@ -671,6 +671,11 @@ class MetalModelRunner:
         # Request state cache for incremental decoding
         self._request_states: dict[str, RequestState] = {}
 
+        # GDN slot allocator: stable request_id → slot mapping for hybrid
+        # models so recurrent state survives request reordering/preemption.
+        self._gdn_req_to_slot: dict[str, int] = {}
+        self._gdn_free_slots: list[int] = []
+
         # Pre-allocated buffer for decode input tokens
         self._max_batch_size = _MAX_BATCH_SIZE
 
@@ -806,6 +811,7 @@ class MetalModelRunner:
         with _model_cache_lock:
             if model_name in _model_cache:
                 self.model, self.tokenizer = _model_cache[model_name]
+                self._is_vlm = is_vlm
                 load_time = time.time() - start_time
                 logger.info(
                     f"Model loaded from cache in {load_time:.3f}s: {model_name}"
@@ -924,8 +930,14 @@ class MetalModelRunner:
         # Merge nested text_config (Qwen3.5, VLMs) into top-level args.
         # setdefault preserves any top-level keys that already exist.
         tc = self.model_args.get("text_config")
-        if isinstance(tc, dict):
-            for k, v in tc.items():
+        if tc is not None:
+            if isinstance(tc, dict):
+                tc_dict = tc
+            elif hasattr(tc, "to_dict"):
+                tc_dict = tc.to_dict()
+            else:
+                tc_dict = vars(tc) if hasattr(tc, "__dict__") else {}
+            for k, v in tc_dict.items():
                 self.model_args.setdefault(k, v)
 
         if self.metal_config.debug:
@@ -1008,6 +1020,37 @@ class MetalModelRunner:
                 + self.linear_num_v_heads * self.linear_value_head_dim
             )
 
+    def _gdn_alloc_slot(self, req_id: str) -> int:
+        """Allocate a stable GDN state pool slot for a request."""
+        if req_id in self._gdn_req_to_slot:
+            return self._gdn_req_to_slot[req_id]
+        if self._gdn_free_slots:
+            slot = self._gdn_free_slots.pop()
+        else:
+            slot = len(self._gdn_req_to_slot)
+        self._gdn_req_to_slot[req_id] = slot
+        return slot
+
+    def _gdn_free_slot(self, req_id: str) -> None:
+        """Release a GDN state pool slot and zero its state."""
+        slot = self._gdn_req_to_slot.pop(req_id, None)
+        if slot is None:
+            return
+        # Zero conv and recurrent state so the next request doesn't
+        # inherit the previous request's linear-attention history.
+        backend = self._paged_attention_backend
+        if backend is not None and hasattr(backend, "_state_cache"):
+            sc = backend._state_cache
+            if sc is not None:
+                for layer_idx in range(sc.num_layers):
+                    conv = sc.conv_states[layer_idx]
+                    conv[slot] = 0
+                    sc.conv_states[layer_idx] = conv
+                    rec = sc.recurrent_states[layer_idx]
+                    rec[slot] = 0
+                    sc.recurrent_states[layer_idx] = rec
+        self._gdn_free_slots.append(slot)
+
     def _extract_logits(self, model_output: Any) -> mx.array:
         """Extract logits from model output.
 
@@ -1045,7 +1088,10 @@ class MetalModelRunner:
                 ),
             }
 
-        block_size = self.metal_config.block_size
+        # Use cache_config.block_size (not metal_config.block_size) because
+        # vLLM's hybrid alignment may have adjusted it to unify page sizes
+        # across SDPA and Mamba/GDN layers.
+        block_size = self.cache_config.block_size
         if self.kv_cache_dtype is None:
             raise RuntimeError("KV cache dtype not initialized; load_model() first")
 
@@ -1065,6 +1111,7 @@ class MetalModelRunner:
                     value_head_dim=self.linear_value_head_dim,
                     key_head_dim=self.linear_key_head_dim,
                     torch_dtype=torch_dtype,
+                    page_size_padded=self.cache_config.mamba_page_size_padded,
                 )
             else:
                 layer_name = f"layers.{layer_idx}.self_attn"
@@ -1097,7 +1144,9 @@ class MetalModelRunner:
         if self._is_stt:
             return STT_SCHED_BLOCK_BYTES
 
-        block_size = self.metal_config.block_size
+        # Use cache_config.block_size (not metal_config) because vLLM's
+        # hybrid alignment may have adjusted it to match mamba page size.
+        block_size = self.cache_config.block_size
 
         # Each block stores key and value for SDPA layers only.
         # Hybrid models (Qwen3.5) have linear attention layers that use
@@ -1444,6 +1493,20 @@ class MetalModelRunner:
             prefill_info.append((pr.block_ids, len(pr.token_ids), pr.start_pos))
 
         prepare_unified(decode_info, prefill_info, self._paged_block_size)
+
+        # ---- GDN slot mapping (hybrid models) ----
+        if self.is_hybrid:
+            from vllm_metal.paged_attention_common import get_context
+
+            ctx = get_context()
+            if ctx is not None:
+                gdn_slots = []
+                # Decode requests come first, then prefill
+                for req_id, _ in decode_reqs:
+                    gdn_slots.append(self._gdn_alloc_slot(req_id))
+                for pr in prefill_reqs:
+                    gdn_slots.append(self._gdn_alloc_slot(pr.req_id))
+                ctx.gdn_slot_mapping = gdn_slots
 
         # ---- forward ----
         offset_caches = [OffsetCache(0) for _ in range(self.num_layers)]
@@ -1894,6 +1957,7 @@ class MetalModelRunner:
 
             # Block freeing is handled by the scheduler's kv_cache_manager.
             self._paged_request_seq_lens.pop(req_id, None)
+            self._gdn_free_slot(req_id)
 
         self._finished_request_count += len(finished_req_ids)
         if self._finished_request_count < _CACHE_CLEAR_INTERVAL:
